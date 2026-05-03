@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TaskBuddy</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="hero-card">
+        <p class="eyebrow">Beginner AI Agent Project</p>
+        <h1>TaskBuddy</h1>
+        <p class="hero-copy">
+          A tiny AI to-do assistant that uses only 3 function calls: add, list, and complete.
+        </p>
+      </section>
+
+      <section class="workspace">
+        <div class="panel chat-panel">
+          <div class="panel-header">
+            <h2>Chat</h2>
+            <p>Try: “Add buy milk tomorrow”</p>
+          </div>
+
+          <div id="messages" class="messages"></div>
+
+          <form id="chat-form" class="chat-form">
+            <input
+              id="message-input"
+              name="message"
+              type="text"
+              placeholder="Type a task request..."
+              autocomplete="off"
+              required
+            />
+            <button id="send-button" type="submit">Send</button>
+          </form>
+        </div>
+
+        <aside class="panel tasks-panel">
+          <div class="panel-header">
+            <h2>Tasks</h2>
+            <button id="refresh-button" type="button">Refresh</button>
+          </div>
+          <div id="task-list" class="task-list"></div>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
