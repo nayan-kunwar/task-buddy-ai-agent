@@ -3,22 +3,32 @@ const fs = require("fs");
 const path = require("path");
 const { loadEnvFile } = require("./src/env");
 const { tools } = require("./src/tools");
-const { addTask, listTasks, completeTask, readTasks } = require("./src/taskStore");
+const {
+  addTask,
+  listTasks,
+  completeTask,
+  readTasks,
+} = require("./src/taskStore");
 
 loadEnvFile();
 
 const PORT = Number(process.env.PORT || 3000);
 const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const PUBLIC_DIR = path.join(__dirname, "public");
+// Prevents the model from getting stuck in an endless tool-calling loop.
 const MAX_TOOL_ROUNDS = 3;
-const GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai";
+const GEMINI_OPENAI_BASE_URL =
+  "https://generativelanguage.googleapis.com/v1beta/openai";
+const DEBUG_LOGS = process.env.DEBUG === "true";
 
+// Maps the tool name the model sees to the real JavaScript function we run locally.
 const toolHandlers = {
   add_task: ({ title, due_date }) => addTask(title, due_date ?? null),
   list_tasks: ({ status }) => listTasks(status ?? "all"),
   complete_task: ({ task_id }) => completeTask(task_id),
 };
 
+// The system prompt is the agent's operating instruction.
 const systemPrompt = [
   "You are TaskBuddy, a beginner-friendly to-do assistant.",
   "Help the user manage tasks using the provided tools.",
@@ -36,8 +46,30 @@ const mimeTypes = {
   ".ico": "image/x-icon",
 };
 
+function log(level, message, details) {
+  const timestamp = new Date().toISOString();
+  const prefix = `[${timestamp}] [${level}] ${message}`;
+
+  if (details === undefined) {
+    console.log(prefix);
+    return;
+  }
+
+  console.log(prefix, details);
+}
+
+function debugLog(message, details) {
+  if (!DEBUG_LOGS) {
+    return;
+  }
+
+  log("DEBUG", message, details);
+}
+
 function sendJson(response, statusCode, payload) {
-  response.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  response.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+  });
   response.end(JSON.stringify(payload));
 }
 
@@ -68,28 +100,45 @@ function readBody(request) {
 
 async function callGemini(messages) {
   if (!process.env.GEMINI_API_KEY) {
-    throw new Error("Missing GEMINI_API_KEY. Add it to your environment or .env file.");
+    throw new Error(
+      "Missing GEMINI_API_KEY. Add it to your environment or .env file.",
+    );
   }
 
-  const apiResponse = await fetch(`${GEMINI_OPENAI_BASE_URL}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.GEMINI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: MODEL,
-      messages,
-      tools,
-      tool_choice: "auto",
-    }),
+  // We use Gemini's OpenAI-compatible endpoint so the request looks like
+  // standard chat completions with tools.
+  debugLog("Calling Gemini", {
+    model: MODEL,
+    messageCount: messages.length,
   });
+
+  const apiResponse = await fetch(
+    `${GEMINI_OPENAI_BASE_URL}/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.GEMINI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages,
+        tools,
+        tool_choice: "auto",
+      }),
+    },
+  );
 
   if (!apiResponse.ok) {
     const errorText = await apiResponse.text();
+    log("ERROR", "Gemini API request failed", {
+      status: apiResponse.status,
+      body: errorText,
+    });
     throw new Error(`Gemini API error: ${apiResponse.status} ${errorText}`);
   }
 
+  debugLog("Gemini API request completed successfully");
   return apiResponse.json();
 }
 
@@ -98,6 +147,7 @@ function sanitizeMessages(messages) {
     return [];
   }
 
+  // Keep only clean user/assistant text messages and trim long history.
   return messages
     .filter((message) => message && typeof message.content === "string")
     .map((message) => ({
@@ -115,11 +165,28 @@ function formatToolResult(result) {
 async function runAgent(userMessages) {
   const messages = [{ role: "system", content: systemPrompt }, ...userMessages];
 
+  log("INFO", "Agent run started", {
+    userMessageCount: userMessages.length,
+  });
+
+  // This is the core agent loop:
+  // 1. Send messages + tools to Gemini
+  // 2. If Gemini asks for a tool, run it locally
+  // 3. Send the tool result back to Gemini
+  // 4. Stop when Gemini returns a normal text reply
   for (let round = 0; round < MAX_TOOL_ROUNDS; round += 1) {
+    console.log("inside  loop");
+    debugLog("Agent round started", {
+      round: round + 1,
+      maxRounds: MAX_TOOL_ROUNDS,
+    });
+
     const completion = await callGemini(messages);
     const assistantMessage = completion.choices?.[0]?.message;
+    console.log("First message: ", assistantMessage); // {content, role} or {role, tool_calls: [{function: {name, arguments}, id}]}
 
     if (!assistantMessage) {
+      log("ERROR", "Gemini returned no assistant message");
       throw new Error("No assistant message returned by the model.");
     }
 
@@ -129,19 +196,33 @@ async function runAgent(userMessages) {
       tool_calls: assistantMessage.tool_calls,
     });
 
-    if (!assistantMessage.tool_calls || assistantMessage.tool_calls.length === 0) {
+    // If no tool was requested, the model is done and this is the final reply.
+    // {content, role} no tool_calls means the model is done and is giving a final reply to the user.
+    if (
+      !assistantMessage.tool_calls ||
+      assistantMessage.tool_calls.length === 0
+    ) {
+      log("INFO", "Agent completed without further tool calls", {
+        finalReplyLength: (assistantMessage.content || "").length,
+      });
       return {
         reply: assistantMessage.content || "I could not generate a response.",
         model: completion.model,
       };
     }
 
+    log("INFO", "Gemini requested tool calls", {
+      toolCallCount: assistantMessage.tool_calls.length,
+    });
+
     for (const toolCall of assistantMessage.tool_calls) {
+      // tool_calls: []
       const toolName = toolCall.function?.name;
       const rawArgs = toolCall.function?.arguments || "{}";
       const toolHandler = toolHandlers[toolName];
 
       if (!toolHandler) {
+        log("ERROR", "Unsupported tool requested", { toolName });
         throw new Error(`Unsupported tool: ${toolName}`);
       }
 
@@ -149,11 +230,28 @@ async function runAgent(userMessages) {
       try {
         parsedArgs = JSON.parse(rawArgs);
       } catch {
+        log("ERROR", "Tool arguments were not valid JSON", {
+          toolName,
+          rawArgs,
+        });
         throw new Error(`Tool arguments for ${toolName} were not valid JSON.`);
       }
 
+      debugLog("Executing tool", {
+        toolName,
+        args: parsedArgs,
+      });
+
+      // Execute the real local task function.
       const result = toolHandler(parsedArgs);
 
+      debugLog("Tool execution completed", {
+        toolName,
+        result,
+      });
+
+      // Add the tool result back into the conversation so Gemini can use it
+      // to produce the final user-facing answer.
       messages.push({
         role: "tool",
         name: toolName,
@@ -163,6 +261,9 @@ async function runAgent(userMessages) {
     }
   }
 
+  log("ERROR", "Agent exceeded max tool rounds", {
+    maxRounds: MAX_TOOL_ROUNDS,
+  });
   throw new Error("The agent exceeded the maximum tool-call rounds.");
 }
 
@@ -198,8 +299,13 @@ function serveStaticFile(requestPath, response) {
 const server = http.createServer(async (request, response) => {
   try {
     const url = new URL(request.url, `http://${request.headers.host}`);
+    debugLog("Incoming request", {
+      method: request.method,
+      path: url.pathname,
+    });
 
     if (request.method === "GET" && url.pathname === "/api/tasks") {
+      debugLog("Returning tasks list");
       sendJson(response, 200, { tasks: readTasks() });
       return;
     }
@@ -209,12 +315,18 @@ const server = http.createServer(async (request, response) => {
       const messages = sanitizeMessages(body.messages);
 
       if (messages.length === 0) {
+        log("WARN", "Chat request rejected because it had no usable messages");
         sendJson(response, 400, { error: "Please send at least one message." });
         return;
       }
 
+      console.log("message: ", messages);
+      // This is the main entry point into the agent from the frontend.
       const agentResult = await runAgent(messages);
-      sendJson(response, 200, { reply: agentResult.reply, model: agentResult.model });
+      sendJson(response, 200, {
+        reply: agentResult.reply,
+        model: agentResult.model,
+      });
       return;
     }
 
@@ -225,12 +337,20 @@ const server = http.createServer(async (request, response) => {
 
     sendJson(response, 404, { error: "Not found." });
   } catch (error) {
+    log("ERROR", "Request failed", {
+      message:
+        error instanceof Error ? error.message : "Unexpected server error.",
+    });
     sendJson(response, 500, {
-      error: error instanceof Error ? error.message : "Unexpected server error.",
+      error:
+        error instanceof Error ? error.message : "Unexpected server error.",
     });
   }
 });
 
 server.listen(PORT, () => {
-  console.log(`TaskBuddy is running at http://localhost:${PORT}`);
+  log("INFO", `TaskBuddy is running at http://localhost:${PORT}`, {
+    model: MODEL,
+    debugLogs: DEBUG_LOGS,
+  });
 });
